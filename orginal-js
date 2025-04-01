@@ -1,0 +1,395 @@
+const express = require('express');
+const admin = require('firebase-admin');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const winston =require('winston');
+const bcrypt =require('bcrypt');
+const jwt =require('jsonwebtoken');
+const rateLimit=require('express-rate-limit');
+const speakeasy = require('speakeasy');
+
+require('dotenv').config();
+const PORT = 3001;
+
+
+const limiter = rateLimit({
+    windowMs : 15 * 60* 1000,
+    max : 100,
+    massage : 'Too many requestsform this IP please try again after an hour'
+});
+
+const SECRET_KEY = process.env.JWT_SECRET || 'uteq';
+
+
+const serviceAccount = require("./config/firestore.json");
+//inicializa firestore admin SDK
+if (!admin.apps.length) {
+    admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    });
+} else {
+    admin.app(); //si realimente inicializa usa la instancia
+}
+//si import first router.js conect to db, so crash.
+const router = require("./routes");
+
+//inicilize express
+const server = express();
+
+//Middlewares
+server.use(
+    limiter,
+    cors({
+        origin:"http://localhost:3000",
+        credentials: true,
+    })
+);
+
+//setup winston logging for files locally
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.json(),
+    transports: [
+        new winston.transports.File({ filename:'logs/error.log', level: 'error'}),
+        new winston.transports.File({ filename:'logs/all.log', level: 'info'}),
+        new winston.transports.File({ filename:'logs/combined.log'}),
+    ]
+});
+
+server.use(bodyParser.json());
+const db =admin.firestore();
+
+//Middleware
+server.use((req, res, next) => {
+    console.log(`🌪 [${req.method}] ${req.url} - Body:`, req.body);
+    const startTime = Date.now();
+    //snapshot riginal response
+    const originalSend = res.send;
+    let statusCode;
+
+    res.send = function (body) {
+        statusCode = res.statusCode;
+        originalSend.call(this, body);
+    };
+
+    res.on('finish', async () => {
+        //determinar nivel de log basado en status
+        const logLevel = res.statusCode >= 400 ? 'error' : 'info';
+        const responseTime = Date.now() - startTime;
+        const logData = {
+            logLevel: logLevel,
+            Timestamp: new Date(),
+            method: req.method,
+            url:req.url,
+            path: req.path,
+            query: req.query,
+            params: req.params,
+            status:statusCode || res.statusCode,
+            responseTime: responseTime,
+            ip: req.ip || req.connection.remoteAddress, 
+            userAgent: req.get('User-Agent'),
+            protocol: req.protocol,
+            hostname: req.hostname,
+            system: {
+                nodeVersion: process.version,
+                environment: process.env.NODE_ENV || 'development',
+                pid: process.pid
+            },
+        };
+
+         //guardar en archivo local 
+      logger.log({
+        level: logLevel,
+        message: 'Request completed',
+        ...logData
+    });
+
+
+
+    //guardar en file local
+    logger.info(logData);
+
+    //guardar en firestore
+    try {
+        await db.collection('log').add(logData);
+    } catch (error) {
+        logger.error('Error al guardar log en Firestore:', error);
+    }
+    });
+    next();
+});
+
+server.use("/api", router);
+
+//Endpoint de login
+server.post("/login", async (req, res) => {
+    try {
+      const { email, password } = req.body;
+      const userDoc = await db.collection("user").doc(email).get();
+  
+      if (!userDoc.exists) {
+        return res.status(401).json({ message: "Usuario no encontrado" });
+      }
+  
+      const user = userDoc.data();
+      const isPasswordValid = await bcrypt.compare(password, user.password);
+  
+      if (!isPasswordValid) {
+        return res.status(401).json({ message: "Contraseña incorrecta" });
+      }
+  
+      // Genera un token JWT
+      const token = jwt.sign({ email }, SECRET_KEY, { expiresIn: "2h" });
+  
+      res.json({ token, requireMFA: true });
+    } catch (error) {
+      console.error("Error en login:", error);
+      res.status(500).json({ message: "Error interno del servidor" });
+    }
+  });
+
+//middeware para veridicar el token
+const verifyToken = (req, res, next) => {
+    const token = req.headers["authorization"];
+    if (!token) return res.status(403).json({message: "Token requerido"});
+
+    jwt.verify(token.split(" ") [1], SECRET_KEY, (err, decoded) => {
+        if (error)
+            return res.status(401).json({messeage: "Token invalido o expirado"});
+        req.user = decoded;
+        next();
+    });
+};
+
+/*ruta protegida
+server.get("/protected", verifyToken, (req, res) => {
+    res.json({ message: "Acceso permitido", user: req.user });
+});
+*/
+server.post("/register", async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        if (!email || !password) {
+            return res.status(400).json({ message: "Email y password son requeridos" });
+        }
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const secret = speakeasy.generateSecret({ length: 20 });
+        const user = {
+            email,
+            password: hashedPassword,
+            mfaSecret: secret.base32,
+        };
+        await db.collection("user").doc(email).set(user);
+        res.json({ secret: secret.otpauth_url });
+    } catch (error) {
+        console.error("Error al registrar usuario:", error);
+        res.status(500).json({ message: "Error interno del servidor" });
+    }
+  });
+
+
+
+
+server.post("/verify-otp", async (req, res) => {
+    const { email, token } = req.body;
+  
+    try {
+      // Accede a Firestore y busca el usuario por su email
+      const snapshot = await db.collection("user").where("email", "==", email).get();
+  
+      if (snapshot.empty) {
+        return res.status(404).json({ error: "Usuario no encontrado" });
+      }
+  
+      // Extrae el usuario encontrado
+      const userDoc = snapshot.docs[0];
+      const user = userDoc.data();
+  
+      // Verifica el código OTP
+      const verified = speakeasy.totp.verify({
+        secret: user.mfaSecret,  // Asegúrate de que 'mfaSecret' existe en Firestore
+        encoding: "base32",
+        token,
+        window: 1
+      });
+  
+      if (verified) {
+        res.json({ success: true });
+      } else {
+        res.status(401).json({ success: false, error: "Código incorrecto" });
+      }
+    } catch (error) {
+      console.error("Error al verificar OTP:", error);
+      res.status(500).json({ error: "Error interno del servidor" });
+    }
+  });
+
+  // API Routes
+server.get('/api/getInfo', (req, res) => {
+    res.json({
+        nodeVersion: process.version,
+        studentInfo: {
+            fullName: "Tu Nombre Completo", // Replace with your actual name
+            group: "Tu Grupo" // Replace with your actual group
+        },
+        timestamp: new Date().toISOString()
+    });
+});
+  
+server.listen(PORT, () => {
+    console.log(`Servidor corriendo en http://localhost:${PORT}`);
+});
+
+
+
+
+
+const express = require('express');
+const bcrypt =require('bcrypt');
+const jwt = require('jsonwebtoken');
+const admin = require('firebase-admin');
+const router = express.Router();
+const speakeasy = require('speakeasy');
+const db = admin.firestore();
+const JWT_SECRET = process.env.JWT_SECRET || 'uteq';
+console.debug('Usign JWT secret: ' + JWT_SECRET);
+//user registration
+let requestCounter = 0;
+/*
+const validateEmail = (email) => {
+    const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return re.test(email);
+};
+
+const validateFields = (fields) => {
+    for (const [key, value] of Object.entries(fields)) {
+        if (!value || value.trim() === '') {
+            return { valid: false, field: key };
+        }
+    }
+    return { valid: true };
+};
+
+router.post('/login', async (req, res, next) => {
+    try {
+        const { email, password } = req.body;
+        
+        // Validar campos
+        const fieldValidation = validateFields({ email, password });
+        if (!fieldValidation.valid) {
+            return res.status(400).json({ 
+                message: `El campo ${fieldValidation.field} no puede estar vacío` 
+            });
+        }
+        
+        // Obtener usuario
+        const userRef = db.collection('user').doc(email);
+        const doc = await userRef.get();
+        
+        if (!doc.exists) {
+            return res.status(401).json({ message: 'Credenciales inválidas' });
+        }
+        
+        const user = doc.data();
+        
+        // Verificar contraseña
+        const validPassword = await bcrypt.compare(password, user.password);
+        if (!validPassword) {
+            return res.status(401).json({ message: 'Credenciales inválidas' });
+        }
+        
+        // Generar token JWT
+        const token = jwt.sign(
+            { email: user.email, username: user.username },
+            JWT_SECRET,
+            { expiresIn: '1h' }
+        );
+        
+        res.json({ 
+            token,
+            requireMFA: true,
+            mfaSecret: user.mfaSecret // En producción, no devolver esto
+        });
+        
+    } catch (error) {
+        next(error);
+    }
+});
+
+router.post('/register', async (req, res, next) => {
+    try {
+        const { email, username, password } = req.body;
+        
+        // Validar campos no vacíos
+        const fieldValidation = validateFields({ email, username, password });
+        if (!fieldValidation.valid) {
+            return res.status(400).json({ 
+                message: `El campo ${fieldValidation.field} no puede estar vacío` 
+            });
+        }
+        
+        // Validar formato de email
+        if (!validateEmail(email)) {
+            return res.status(400).json({ message: 'Formato de email inválido' });
+        }
+        
+        // Verificar si el usuario ya existe
+        const userRef = db.collection('user').doc(email);
+        const doc = await userRef.get();
+        
+        if (doc.exists) {
+            return res.status(400).json({ message: 'El usuario ya existe' });
+        }
+        
+        // Hashear contraseña y crear usuario
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const secret = speakeasy.generateSecret({ length: 20 });
+        
+        await userRef.set({
+            username,
+            email,
+            password: hashedPassword,
+            mfaSecret: secret.base32,
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        
+        res.status(201).json({ 
+            message: 'Usuario registrado exitosamente',
+            mfaSecret: secret.base32 // En producción, no deberías devolver esto
+        });
+        
+    } catch (error) {
+        next(error);
+    }
+});*/
+// Ruta para obtener usuarios
+router.get('/users', async (req, res, next) => {
+    try {
+        // Incrementar el contador de peticiones
+        requestCounter++;
+
+        // Si el contador es divisible por 2, generar un error
+        if (requestCounter % 3 === 0) {
+            // Crear un error simulado
+            const error = new Error('Error simulado cada 2 peticiones');
+            error.statusCode = 500; // Asignar un código de estado al error
+            throw error; // Lanzar el error para que el middleware en server.js lo maneje
+        }
+
+        // Obtener todos los documentos de la colección 'user'
+        const usersSnapshot = await db.collection('user').get();
+        const users = [];
+        usersSnapshot.forEach((doc) => {
+            const userData = doc.data();
+            // No devolver la contraseña por seguridad
+            delete userData.password;
+            users.push({ id: doc.id, ...userData });
+        });
+        res.status(200).json(users);
+    } catch (error) {
+        // Pasar el error al middleware en server.js
+        next(error); // Ahora `next` está definido
+    }
+});
+module.exports = router;
+
