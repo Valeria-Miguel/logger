@@ -3,7 +3,7 @@ const admin = require('firebase-admin');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const winston =require('winston');
-const bcrypt =require('bcrypt');
+const bcrypt =require('bcryptjs');
 const jwt =require('jsonwebtoken');
 const rateLimit=require('express-rate-limit');
 const speakeasy = require('speakeasy');
@@ -21,7 +21,8 @@ const limiter = rateLimit({
 
 const SECRET_KEY = process.env.JWT_SECRET || 'uteq';
 
-const serviceAccount = require("../config/firestore.json");
+//const serviceAccount = require("../config/firestore.json");
+const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_KEY)
 
 if (!admin.apps.length) {
     admin.initializeApp({
