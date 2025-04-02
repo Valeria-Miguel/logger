@@ -7,6 +7,7 @@ const bcrypt =require('bcrypt');
 const jwt =require('jsonwebtoken');
 const rateLimit=require('express-rate-limit');
 const speakeasy = require('speakeasy');
+const { Timestamp } = require('firebase-admin/firestore');
 
 require('dotenv').config();
 const PORT = 3001;
@@ -15,28 +16,24 @@ const PORT = 3001;
 const limiter = rateLimit({
     windowMs : 10 * 60* 1000,
     max : 100,
-    massage : 'TDemasiadas peticiones desde esta IP. Inténtalo de nuevo más tarde'
+    massage : 'Demasiadas peticiones desde esta IP. Inténtalo de nuevo más tarde'
 });
 
 const SECRET_KEY = process.env.JWT_SECRET || 'uteq';
 
+const serviceAccount = require("../config/firestore.json");
 
-const serviceAccount = require("./config/firestore.json");
-//inicializa firestore admin SDK
 if (!admin.apps.length) {
     admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
     });
 } else {
-    admin.app(); //si realimente inicializa usa la instancia
+    admin.app(); 
 }
-//si import first router.js conect to db, so crash.
 const router = require("./routes");
 
-//inicilize express
 const server = express();
 
-//Middlewares
 server.use(
     limiter,
     cors({
@@ -404,7 +401,7 @@ server.post("/verify-otp", async (req, res) => {
     }
 });
   
-server.get("/api/logs", verifyToken, async (req, res) => {
+/*server.get("/api/logs", verifyToken, async (req, res) => {
     const snapshot = await db.collection("log")
         .orderBy("Timestamp", "desc")
         .limit(50)
@@ -412,7 +409,156 @@ server.get("/api/logs", verifyToken, async (req, res) => {
     const logs = snapshot.docs.map(doc => doc.data());
     res.json(logs);
 });
+*/
+// Controlador para obtener logs con filtros dinámicos
+server.get("/api/logs", verifyToken, async (req, res) => {
+    try {
+        // Parámetros de consulta
+        const { 
+            startDate, 
+            endDate, 
+            logLevel, 
+            method, 
+            statusCode,
+            limit = 1000  // Límite por defecto para evitar sobrecarga
+        } = req.query;
+        
+        let query = db.collection("log");
+        
+        // Filtro por rango de fechas
+        if (startDate && endDate) {
+            query = query.where("Timestamp", ">=", new Date(startDate))
+                        .where("Timestamp", "<=", new Date(endDate));
+        } else if (startDate) {
+            query = query.where("Timestamp", ">=", new Date(startDate));
+        } else if (endDate) {
+            query = query.where("Timestamp", "<=", new Date(endDate));
+        }
+        
+        // Filtros adicionales
+        if (logLevel) {
+            query = query.where("logLevel", "==", logLevel.toLowerCase());
+        }
+        if (method) {
+            query = query.where("method", "==", method.toUpperCase());
+        }
+        if (statusCode) {
+            query = query.where("status", "==", parseInt(statusCode));
+        }
+        
+        // Orden y límite
+        query = query.orderBy("Timestamp", "desc");
+        
+        if (limit && !isNaN(limit)) {
+            query = query.limit(parseInt(limit));
+        }
+        
+        const snapshot = await query.get();
+        const logs = snapshot.docs.map(doc => {
+            const data = doc.data();
+            // Aseguramos que el timestamp sea un objeto Date válido
+            data.Timestamp = data.Timestamp.toDate ? data.Timestamp.toDate() : new Date(data.Timestamp);
+            return data;
+        });
+        
+        res.json(logs);
+    } catch (error) {
+        console.error("Error fetching logs:", error);
+        res.status(500).json({ error: "Error al obtener los logs" });
+    }
+});
 
+// Endpoint para estadísticas (usado por las gráficas)
+server.get("/api/logs/stats", verifyToken, async (req, res) => {
+    try {
+        const { period = 'hour', groupBy = 'logLevel' } = req.query;
+        const now = new Date();
+        let startDate;
+        
+        // Definir el rango de tiempo según el período solicitado
+        switch (period) {
+            case 'hour':
+                startDate = new Date(now.getTime() - (60 * 60 * 1000));
+                break;
+            case 'day':
+                startDate = new Date(now.getTime() - (24 * 60 * 60 * 1000));
+                break;
+            case 'week':
+                startDate = new Date(now.getTime() - (7 * 24 * 60 * 60 * 1000));
+                break;
+            case 'month':
+                startDate = new Date(now.getTime() - (30 * 24 * 60 * 60 * 1000));
+                break;
+            default:
+                return res.status(400).json({ error: "Período no válido" });
+        }
+        
+        const snapshot = await db.collection("log")
+            .where("Timestamp", ">=", startDate)
+            .get();
+        
+        const logs = snapshot.docs.map(doc => doc.data());
+        
+        // Procesamiento para gráficas
+        const stats = {
+            logLevels: {},
+            methods: {},
+            statusCodes: {},
+            responseTimes: {
+                '<100ms': 0,
+                '100-500ms': 0,
+                '500-1000ms': 0,
+                '>1000ms': 0
+            },
+            timeline: []
+        };
+        
+        // Agrupar datos
+        logs.forEach(log => {
+            // Por nivel de log
+            stats.logLevels[log.logLevel] = (stats.logLevels[log.logLevel] || 0) + 1;
+            
+            // Por método HTTP
+            stats.methods[log.method] = (stats.methods[log.method] || 0) + 1;
+            
+            // Por código de estado
+            const statusGroup = `${Math.floor(log.status / 100)}xx`;
+            stats.statusCodes[statusGroup] = (stats.statusCodes[statusGroup] || 0) + 1;
+            
+            // Por tiempo de respuesta
+            if (log.responseTime < 100) stats.responseTimes['<100ms']++;
+            else if (log.responseTime < 500) stats.responseTimes['100-500ms']++;
+            else if (log.responseTime < 1000) stats.responseTimes['500-1000ms']++;
+            else stats.responseTimes['>1000ms']++;
+            
+            // Para la línea de tiempo (agrupar por intervalos)
+            const logTime = log.Timestamp.toDate ? log.Timestamp.toDate() : new Date(log.Timestamp);
+            const timeKey = groupBy === 'minute' ? 
+                logTime.toISOString().substring(0, 16) : // Por minuto
+                logTime.toISOString().substring(0, 13); // Por hora
+            
+            if (!stats.timeline[timeKey]) {
+                stats.timeline[timeKey] = {
+                    timestamp: timeKey,
+                    count: 0,
+                    byLevel: {}
+                };
+            }
+            stats.timeline[timeKey].count++;
+            stats.timeline[timeKey].byLevel[log.logLevel] = 
+                (stats.timeline[timeKey].byLevel[log.logLevel] || 0) + 1;
+        });
+        
+        // Convertir timeline de objeto a array
+        stats.timeline = Object.values(stats.timeline)
+            .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+        
+        res.json(stats);
+    } catch (error) {
+        console.error("Error generating stats:", error);
+        res.status(500).json({ error: "Error al generar estadísticas" });
+    }
+});
 
 
 
