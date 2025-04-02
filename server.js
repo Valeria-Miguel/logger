@@ -38,7 +38,7 @@ const server = express();
 server.use(
     limiter,
     cors({
-        origin:"http://localhost:3000",
+        origin:"https://front-logger-seg.vercel.app/",
         credentials: true,
         methods: ["GET", "POST", "OPTIONS"]
     })
