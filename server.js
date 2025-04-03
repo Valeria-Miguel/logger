@@ -514,7 +514,6 @@ server.get('/api/getInfo-SINTK', (req, res) => {
             timestamp: new Date().toISOString()
         };
         
-        console.log("Enviando respuesta:", responseData);
         res.json(responseData);
     } catch (error) {
         res.status(500).json({ error: "Error interno del servidor" });
