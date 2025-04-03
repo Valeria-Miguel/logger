@@ -21,7 +21,6 @@ const limiter = rateLimit({
 
 const SECRET_KEY = process.env.JWT_SECRET || 'uteq';
 
-//const serviceAccount = require("../config/firestore.json");
 const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_KEY)
 
 if (!admin.apps.length) {
@@ -44,7 +43,6 @@ server.use(
     })
 );
 
-//setup winston logging for files locally
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.json(),
@@ -58,11 +56,8 @@ const logger = winston.createLogger({
 server.use(bodyParser.json());
 const db =admin.firestore();
 
-//middeware para veridicar el token
-
 const verifyToken = (req, res, next) => {
     try {
-        // 1. Obtener token de múltiples fuentes
         const token = req.headers["authorization"]?.split(" ")[1] || 
                      req.query.token || 
                      req.cookies.token;
@@ -72,7 +67,6 @@ const verifyToken = (req, res, next) => {
             return res.status(403).json({message: "Token requerido"});
         }
 
-        // 2. Verificar token
         jwt.verify(token, SECRET_KEY, (err, decoded) => {
             if (err) {
                 console.error("Error verificando token:", {
@@ -88,7 +82,6 @@ const verifyToken = (req, res, next) => {
                 return res.status(401).json({message: "Token inválido"});
             }
 
-            // 3. Verificar datos básicos del token
             if (!decoded.email) {
                 console.error("Token no contiene email");
                 return res.status(401).json({message: "Token mal formado"});
@@ -102,18 +95,15 @@ const verifyToken = (req, res, next) => {
         return res.status(500).json({message: "Error interno al verificar token"});
     }
 };
-// Variable global para almacenar clientes conectados
 const clients = new Set();
 
-
-// Endpoint SSE específico con headers manuales
 server.get("/api/logs/stream", verifyToken, (req, res) => {
-    // Configurar headers específicos para SSE
+ 
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': 'http://localhost:3000',
+        'Access-Control-Allow-Origin': 'https://front-logger.vercel.app',
         'Access-Control-Allow-Credentials': 'true'
     });
     res.flushHeaders();
@@ -125,10 +115,8 @@ server.get("/api/logs/stream", verifyToken, (req, res) => {
     };
     clients.add(newClient);
 
-    // Enviar evento de conexión establecida
     res.write(`event: connect\ndata: ${JSON.stringify({msg: "Conexión SSE establecida", clientId})}\n\n`);
 
-    // Heartbeat cada 30 segundos
     const heartbeat = setInterval(() => {
         res.write(`event: heartbeat\ndata: ${JSON.stringify({time: new Date().toISOString()})}\n\n`);
     }, 30000);
@@ -139,13 +127,12 @@ server.get("/api/logs/stream", verifyToken, (req, res) => {
         console.log(`Cliente ${clientId} desconectado`);
     });
 });
-// Función para notificar a todos los clientes sobre nuevos logs
 const notifyClients = (logData) => {
-    console.log("Preparando para enviar a clientes:", logData); // 👈 Debug
+    console.log("Preparando para enviar a clientes:", logData);
     const sseFormattedData = `event: newLog\ndata: ${JSON.stringify(logData)}\n\n`;
     clients.forEach(client => {
         try {
-            console.log("Enviando a cliente:", client.id); // 👈 Debug
+            console.log("Enviando a cliente:", client.id); 
             client.res.write(sseFormattedData);
         } catch (error) {
             console.error("Error enviando SSE:", error);
@@ -155,12 +142,10 @@ const notifyClients = (logData) => {
 };;
 
 
-
-//Middleware
 server.use((req, res, next) => {
     console.log(`🌪 [${req.method}] ${req.url} - Body:`, req.body);
     const startTime = Date.now();
-    //snapshot riginal response
+
     const originalSend = res.send;
     let statusCode;
 
@@ -170,7 +155,6 @@ server.use((req, res, next) => {
     };
 
     res.on('finish', async () => {
-        //determinar nivel de log basado en status
         const logLevel = res.statusCode >= 400 ? 'error' : 'info';
         const responseTime = Date.now() - startTime;
         const logData = {
@@ -194,7 +178,6 @@ server.use((req, res, next) => {
             },
         };
 
-         //guardar en archivo local 
       logger.log({
         level: logLevel,
         message: 'Request completed',
@@ -202,15 +185,12 @@ server.use((req, res, next) => {
     });
 
 
-
-    //guardar en file local
     logger.info(logData);
     
-    //guardar en firestore
     try {
         await db.collection('log').add(logData);
         console.log("Nuevo log guardado, notificando clientes:", logData);
-        notifyClients(logData);// Notificar a todos los clientes SSE
+        notifyClients(logData);
     } catch (error) {
         logger.error('Error al guardar log en Firestore:', error);
     }
@@ -220,7 +200,6 @@ server.use((req, res, next) => {
 
 server.use("/api", router);
 
-//Endpoint de login
 server.post("/login", async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -237,10 +216,8 @@ server.post("/login", async (req, res) => {
             return res.status(401).json({ message: "Contraseña incorrecta" });
         }
 
-        // Generar token JWT temporal (sin MFA aún)
         const tempToken = jwt.sign({ email }, SECRET_KEY, { expiresIn: "5m" });
 
-        // Indicar que se requiere MFA
         res.json({ 
             tempToken, 
             requireMFA: true 
@@ -255,11 +232,10 @@ server.post("/verify-mfa", async (req, res) => {
     const { email, token, tempToken } = req.body;
 
     try {
-        // Verificar token temporal primero
+
         jwt.verify(tempToken, SECRET_KEY, async (err, decoded) => {
             if (err) return res.status(401).json({ message: "Token inválido o expirado" });
 
-            // Obtener secreto MFA del usuario
             const userDoc = await db.collection("user").doc(email).get();
             const user = userDoc.data();
 
@@ -271,7 +247,6 @@ server.post("/verify-mfa", async (req, res) => {
             });
 
             if (verified) {
-                // Generar token JWT final (válido por 2 horas)
                 const finalToken = jwt.sign({ email }, SECRET_KEY, { expiresIn: "2h" });
                 res.json({ 
                     success: true, 
@@ -288,17 +263,12 @@ server.post("/verify-mfa", async (req, res) => {
 });
 
 
-/*ruta protegida
-server.get("/protected", verifyToken, (req, res) => {
-    res.json({ message: "Acceso permitido", user: req.user });
-});
-*/
 server.post("/register", async (req, res) => {
     try {
         const { email, username, password } = req.body;
         console.log("Datos recibidos:", { email, username, password });
 
-        // Validaciones
+
         if (!email || !username || !password) {
             return res.status(400).json({ 
                 message: "Campos requeridos: email, username, password",
@@ -312,29 +282,25 @@ server.post("/register", async (req, res) => {
             return res.status(400).json({ message: "La contraseña debe tener al menos 8 caracteres" });
         }
 
-        // Verificar si el usuario ya existe
         const userDoc = await db.collection("user").doc(email).get();
         if (userDoc.exists) {
             return res.status(400).json({ message: "El email ya está registrado" });
         }
 
-        // Hash de contraseña y generar secreto MFA
         const hashedPassword = await bcrypt.hash(password, 10);
         const secret = speakeasy.generateSecret({ length: 20 });
 
-        // Guardar usuario en Firestore
         await db.collection("user").doc(email).set({
             email,
             username,
             password: hashedPassword,
-            mfaSecret: secret.base32,  // Almacena el secreto en base32
+            mfaSecret: secret.base32, 
         });
 
-        // Respuesta exitosa con datos para MFA
         res.json({ 
             success: true,
-            mfaUrl: secret.otpauth_url,  // URL para el QR
-            mfaSecret: secret.base32     // Secreto para verificación manual (opcional)
+            mfaUrl: secret.otpauth_url, 
+            mfaSecret: secret.base32     
         });
 
     } catch (error) {
@@ -350,20 +316,18 @@ server.post("/verify-otp", async (req, res) => {
     const { email, token } = req.body;
   
     try {
-      // Accede a Firestore y busca el usuario por su email
+
       const snapshot = await db.collection("user").where("email", "==", email).get();
   
       if (snapshot.empty) {
         return res.status(404).json({ error: "Usuario no encontrado" });
       }
   
-      // Extrae el usuario encontrado
       const userDoc = snapshot.docs[0];
       const user = userDoc.data();
-  
-      // Verifica el código OTP
+
       const verified = speakeasy.totp.verify({
-        secret: user.mfaSecret,  // Asegúrate de que 'mfaSecret' existe en Firestore
+        secret: user.mfaSecret,
         encoding: "base32",
         token,
         window: 1
@@ -380,9 +344,8 @@ server.post("/verify-otp", async (req, res) => {
     }
   });
 
-  // API Routes
   server.get('/api/getInfo', verifyToken, (req, res) => {
-    console.log("Usuario autenticado:", req.user); // Debug
+    console.log("Usuario autenticado:", req.user); 
     
     try {
         const responseData = {
@@ -394,7 +357,7 @@ server.post("/verify-otp", async (req, res) => {
             timestamp: new Date().toISOString()
         };
         
-        console.log("Enviando respuesta:", responseData); // Debug
+        console.log("Enviando respuesta:", responseData);
         res.json(responseData);
     } catch (error) {
         console.error("Error en /api/getInfo:", error);
@@ -402,31 +365,21 @@ server.post("/verify-otp", async (req, res) => {
     }
 });
   
-/*server.get("/api/logs", verifyToken, async (req, res) => {
-    const snapshot = await db.collection("log")
-        .orderBy("Timestamp", "desc")
-        .limit(50)
-        .get();
-    const logs = snapshot.docs.map(doc => doc.data());
-    res.json(logs);
-});
-*/
-// Controlador para obtener logs con filtros dinámicos
+
 server.get("/api/logs", verifyToken, async (req, res) => {
     try {
-        // Parámetros de consulta
+
         const { 
             startDate, 
             endDate, 
             logLevel, 
             method, 
             statusCode,
-            limit = 1000  // Límite por defecto para evitar sobrecarga
+            limit = 1000
         } = req.query;
         
         let query = db.collection("log");
         
-        // Filtro por rango de fechas
         if (startDate && endDate) {
             query = query.where("Timestamp", ">=", new Date(startDate))
                         .where("Timestamp", "<=", new Date(endDate));
@@ -435,8 +388,6 @@ server.get("/api/logs", verifyToken, async (req, res) => {
         } else if (endDate) {
             query = query.where("Timestamp", "<=", new Date(endDate));
         }
-        
-        // Filtros adicionales
         if (logLevel) {
             query = query.where("logLevel", "==", logLevel.toLowerCase());
         }
@@ -447,7 +398,6 @@ server.get("/api/logs", verifyToken, async (req, res) => {
             query = query.where("status", "==", parseInt(statusCode));
         }
         
-        // Orden y límite
         query = query.orderBy("Timestamp", "desc");
         
         if (limit && !isNaN(limit)) {
@@ -457,7 +407,6 @@ server.get("/api/logs", verifyToken, async (req, res) => {
         const snapshot = await query.get();
         const logs = snapshot.docs.map(doc => {
             const data = doc.data();
-            // Aseguramos que el timestamp sea un objeto Date válido
             data.Timestamp = data.Timestamp.toDate ? data.Timestamp.toDate() : new Date(data.Timestamp);
             return data;
         });
@@ -469,14 +418,12 @@ server.get("/api/logs", verifyToken, async (req, res) => {
     }
 });
 
-// Endpoint para estadísticas (usado por las gráficas)
 server.get("/api/logs/stats", verifyToken, async (req, res) => {
     try {
         const { period = 'hour', groupBy = 'logLevel' } = req.query;
         const now = new Date();
         let startDate;
         
-        // Definir el rango de tiempo según el período solicitado
         switch (period) {
             case 'hour':
                 startDate = new Date(now.getTime() - (60 * 60 * 1000));
@@ -500,7 +447,7 @@ server.get("/api/logs/stats", verifyToken, async (req, res) => {
         
         const logs = snapshot.docs.map(doc => doc.data());
         
-        // Procesamiento para gráficas
+        
         const stats = {
             logLevels: {},
             methods: {},
@@ -514,29 +461,24 @@ server.get("/api/logs/stats", verifyToken, async (req, res) => {
             timeline: []
         };
         
-        // Agrupar datos
         logs.forEach(log => {
-            // Por nivel de log
+
             stats.logLevels[log.logLevel] = (stats.logLevels[log.logLevel] || 0) + 1;
-            
-            // Por método HTTP
+ 
             stats.methods[log.method] = (stats.methods[log.method] || 0) + 1;
             
-            // Por código de estado
             const statusGroup = `${Math.floor(log.status / 100)}xx`;
             stats.statusCodes[statusGroup] = (stats.statusCodes[statusGroup] || 0) + 1;
             
-            // Por tiempo de respuesta
             if (log.responseTime < 100) stats.responseTimes['<100ms']++;
             else if (log.responseTime < 500) stats.responseTimes['100-500ms']++;
             else if (log.responseTime < 1000) stats.responseTimes['500-1000ms']++;
             else stats.responseTimes['>1000ms']++;
             
-            // Para la línea de tiempo (agrupar por intervalos)
             const logTime = log.Timestamp.toDate ? log.Timestamp.toDate() : new Date(log.Timestamp);
             const timeKey = groupBy === 'minute' ? 
-                logTime.toISOString().substring(0, 16) : // Por minuto
-                logTime.toISOString().substring(0, 13); // Por hora
+                logTime.toISOString().substring(0, 16) : 
+                logTime.toISOString().substring(0, 13); 
             
             if (!stats.timeline[timeKey]) {
                 stats.timeline[timeKey] = {
@@ -550,7 +492,6 @@ server.get("/api/logs/stats", verifyToken, async (req, res) => {
                 (stats.timeline[timeKey].byLevel[log.logLevel] || 0) + 1;
         });
         
-        // Convertir timeline de objeto a array
         stats.timeline = Object.values(stats.timeline)
             .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
         
@@ -561,7 +502,24 @@ server.get("/api/logs/stats", verifyToken, async (req, res) => {
     }
 });
 
-
+server.get('/api/getInfo-SINTK', (req, res) => {
+    
+    try {
+        const responseData = {
+            nodeVersion: process.version,
+            studentInfo: {
+                fullName: "Dulce Valeria Miguel Juan",
+                group: "IDGS11"
+            },
+            timestamp: new Date().toISOString()
+        };
+        
+        console.log("Enviando respuesta:", responseData);
+        res.json(responseData);
+    } catch (error) {
+        res.status(500).json({ error: "Error interno del servidor" });
+    }
+});
 
 server.listen(PORT, () => {
     console.log(`Servidor corriendo en http://localhost:${PORT}`);
